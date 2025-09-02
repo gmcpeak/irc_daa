@@ -14,46 +14,6 @@ from openai import OpenAI
 # Config & constants
 # -----------------------------
 st.set_page_config(page_title="GW+IRC DAA", layout="wide")
-st.markdown(
-    """
-    <style>
-      .block-container { max-width: 960px; margin: 0 auto; }
-
-      /* Preview card */
-      .preview-card {
-        border: 1px solid rgba(49,51,63,.2);
-        border-radius: 12px;
-        padding: 8px;
-        background: #f9f9fb;
-      }
-      .preview-inner {
-        width: 720px;          /* frame width */
-        height: 420px;         /* frame height */
-        display: flex;         /* center the image box */
-        align-items: center;
-        justify-content: center;
-        margin: 0 auto;
-      }
-      .preview-inner img {
-        /* key: scale down to fit the frame without cropping */
-        max-width: 100%;
-        max-height: 100%;
-        width: auto;
-        height: auto;
-        object-fit: contain;   /* keeps full image visible if width/height are set */
-        display: block;
-      }
-
-      .preview-empty {
-        color: #666;
-        text-align: center;
-        padding: 48px 12px;
-      }
-      .stButton>button { height: 3rem; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
 
 PROMPT_PATH = "./assets/system_prompt.txt"
 DOC1_PATH   = "./assets/Goodwill-Donation-Value-Guide.txt"
@@ -111,40 +71,6 @@ def _load_pil_from_uploaded(uploaded) -> Optional[PILImage]:
             return ImageOps.exif_transpose(Image.open(io.BytesIO(data)))
         except Exception:
             return None
-
-def _data_url_from_pil(image: PILImage) -> str:
-    """Convert a PIL image to a data URL for the HTML preview box."""
-    buf = io.BytesIO()
-    image.save(buf, format="PNG")
-    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-    return f"data:image/png;base64,{b64}"
-
-def _render_preview(image: Optional[PILImage]):
-    st.markdown("### Preview")
-    if image is None:
-        st.markdown(
-            """
-            <div class="preview-card">
-              <div class="preview-inner">
-                <div class="preview-empty">No image selected yet.</div>
-              </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        return
-
-    data_url = _data_url_from_pil(image)
-    st.markdown(
-        f"""
-        <div class="preview-card">
-          <div class="preview-inner">
-            <img src="{data_url}" alt="Selected image preview" />
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
 
 def _process(prompt_text: str, image: Optional[PILImage]) -> str:
     """Call OpenAI Responses API with multimodal input and web_search tool."""
@@ -218,5 +144,3 @@ if process_clicked:
     out_area.markdown(out_text if out_text else "_No output._")
 else:
     pass
-
-_render_preview(image_pil)
