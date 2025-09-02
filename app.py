@@ -4,11 +4,13 @@ import io
 import base64
 from pathlib import Path
 from typing import Optional, List
+from datetime import datetime
 
 import streamlit as st
 from PIL import Image, ImageOps
 from PIL.Image import Image as PILImage
 from openai import OpenAI
+from docx import Document  # NEW: for .docx output
 
 # -----------------------------
 # Config & constants
@@ -19,8 +21,18 @@ PROMPT_PATH = "./assets/system_prompt.txt"
 DOC1_PATH   = "./assets/Goodwill-Donation-Value-Guide.txt"
 DOC2_PATH   = "./assets/Salvation-Army-Donation-Value-Guide.txt"
 
-openai_key = st.secrets["openai_key"]
+openai_key = st.secrets.get("openai_key")  # safer get()
 client = OpenAI(api_key=openai_key) if openai_key else None
+
+# -----------------------------
+# Session state (for download)
+# -----------------------------
+if "last_output" not in st.session_state:
+    st.session_state.last_output = None
+if "docx_bytes" not in st.session_state:
+    st.session_state.docx_bytes = None
+if "docx_filename" not in st.session_state:
+    st.session_state.docx_filename = None
 
 # -----------------------------
 # Helpers
@@ -94,6 +106,39 @@ def _process(prompt_text: str, image: Optional[PILImage]) -> str:
             text = str(response)
     return text
 
+def _docx_bytes_from_text(
+    text: str,
+    image: Optional[PILImage],
+    title: str = "Donation Audit",
+) -> bytes:
+    """
+    Build a .docx in memory. Adds a heading, then the original image
+    (scaled to fit within page margins), then the generated text.
+    """
+    doc = Document()
+
+    # Heading
+    if title:
+        doc.add_heading(title, level=0)
+
+    # Image (after header, before text)
+    if image is not None:
+        img_buf = io.BytesIO()
+        image.save(img_buf, format="PNG")
+        img_buf.seek(0)  # important when using BytesIO
+        section = doc.sections[0]
+        max_width = section.page_width - section.left_margin - section.right_margin
+        doc.add_picture(img_buf, width=max_width)
+        doc.add_paragraph("")  # a little space after the image
+
+    # Text (preserve blank lines)
+    for line in (text or "").splitlines():
+        doc.add_paragraph(line)
+
+    out = io.BytesIO()
+    doc.save(out)
+    return out.getvalue()
+
 # -----------------------------
 # UI
 # -----------------------------
@@ -141,6 +186,21 @@ if process_clicked:
         except Exception as e:
             out_text = f"Error calling OpenAI: {e}"
 
+    # Show output
     out_area.markdown(out_text if out_text else "_No output._")
-else:
-    pass
+
+    # Build .docx bytes and stash in session_state for the next rerun
+    st.session_state.last_output = out_text
+    st.session_state.docx_bytes = _docx_bytes_from_text(out_text or "", image_pil)
+    st.session_state.docx_filename = f"GW-IRC-Donation-Value-Audit--{datetime.now().strftime('%Y%m%d-%H%M%S')}.docx"
+
+# Show download button only after we have generated output
+if st.session_state.docx_bytes and st.session_state.last_output:
+    st.download_button(
+        label="Download as Word (.docx)",
+        data=st.session_state.docx_bytes,
+        file_name=st.session_state.docx_filename,
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        help="Save the generated output as a Word document",
+        key="download_docx"
+    )
