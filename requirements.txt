@@ -1,2 +1,8 @@
-openai
+streamlit==1.* 
+openai>=1.41.0
 python-docx
+Pillow
+python-dotenv
+box-sdk-gen
+azure-servicebus
+pyjwt[crypto]
