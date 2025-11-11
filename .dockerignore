@@ -1,0 +1,16 @@
+# Don’t bloat the image context
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+.venv
+.cache/
+.git/
+.gitignore
+*.log
+workspace/
+# If you keep large local artifacts here, exclude them
+artifacts/
+# OAuth artifacts
+.oauth.tk
+client.pkl
