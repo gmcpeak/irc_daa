@@ -8,5 +8,4 @@ secrets/
 .ent.jwt.tk.dir
 .env
 .jwt.env
-.client.pkl
-.config.json
+config.json
