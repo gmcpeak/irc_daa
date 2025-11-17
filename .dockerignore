@@ -2,8 +2,6 @@
 __pycache__/
 *.py[cod]
 *.egg-info/
-.env
-.venv
 .cache/
 .git/
 .gitignore

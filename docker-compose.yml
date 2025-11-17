@@ -1,20 +1,31 @@
-version: "3.9"
 services:
-  app:
+  worker:
     build:
       context: .
-      dockerfile: Dockerfile
-    container_name: streamlit-jwt-app
+      dockerfile: worker/Dockerfile
+    container_name: donation-worker
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - ./assets:/app/assets:ro
+      - ./.env:/app/.env:ro
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    container_name: donation-frontend
     ports:
       - "8501:8501"
     env_file:
       - .env
-      - .jwt.env
     environment:
-      STREAMLIT_SERVER_PORT: 8501
-    # mount your config json & .env instead of baking them into the image
+      - WORKER_URL=http://worker:8000
+    depends_on:
+      - worker
     volumes:
-      - ./config.json:/app/config.json:ro
-      - ./.env:/app/.env:ro
-      - ./.jwt.env:/app/.jwt.env:ro
       - ./assets:/app/assets:ro
+      - ./.env:/app/.env:ro

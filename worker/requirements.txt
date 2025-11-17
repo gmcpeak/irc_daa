@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+pillow
+python-docx
+openai
+box-sdk-gen[jwt]
+python-multipart   # <-- add this line
