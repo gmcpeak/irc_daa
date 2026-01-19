@@ -58,10 +58,12 @@ BOX_FOLDER_ID = os.getenv("BOX_FOLDER_ID", "333439130395")
 # Job retention (in-memory). If the container restarts, jobs are lost.
 JOB_TTL_SECONDS = int(os.getenv("JOB_TTL_SECONDS", "3600"))  # 1 hour
 MAX_TEXT_CHARS_STORED = int(os.getenv("MAX_TEXT_CHARS_STORED", "200000"))
+POST_COMPLETION_DELAY_SEC = int(os.getenv("POST_COMPLETION_DELAY_SEC", "60"))
 
 client = OpenAI(api_key=OPENAI_KEY)
 
-LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+# Matches [text](url) OR bare https://...
+LINK_RE = re.compile(r"(\[([^\]]+)\]\(([^)]+)\))|((?:https?://|www\.)[^\s()]+)")
 
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
@@ -154,7 +156,7 @@ def _openai_process(prompt_text: str, image: Optional[PILImage]) -> str:
         model=os.getenv("OPENAI_MODEL", "gpt-5.1"),
         reasoning={"effort": "low"},
         text={"verbosity": "low"},
-        # tools intentionally omitted to keep output clean
+        tools=[{"type": "web_search"}],
         input=[{"role": "user", "content": content}] if content else prompt_text,
     )
 
@@ -235,8 +237,18 @@ def _docx_bytes_from_text(
         pos = 0
         for match in LINK_RE.finditer(line):
             start, end = match.span()
-            link_text = match.group(1)
-            link_url = match.group(2)
+
+            # Groups:
+            # 1: Full markdown link [A](B)
+            # 2: Text A
+            # 3: URL B
+            # 4: Bare URL C
+            if match.group(1):
+                link_text = match.group(2)
+                link_url = match.group(3)
+            else:
+                link_text = match.group(4)
+                link_url = match.group(4)
 
             if start > pos:
                 p.add_run(line[pos:start])
@@ -346,6 +358,11 @@ def _process_job(job_id: str, image_bytes: bytes, expected_filename: str) -> Non
             box_file_name=str(box_file_name),
         )
         logging.info("BG: job_id=%s done. Box id=%s", job_id, box_file_id)
+
+        # Wait a bit so the frontend has a chance to download the result (if the healthy process matters)
+        if POST_COMPLETION_DELAY_SEC > 0:
+            logging.info("BG: job_id=%s waiting %ds for retrieval...", job_id, POST_COMPLETION_DELAY_SEC)
+            time.sleep(POST_COMPLETION_DELAY_SEC)
 
     except Exception as e:
         logging.exception("BG: job_id=%s failed.", job_id)

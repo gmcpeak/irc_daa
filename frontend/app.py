@@ -179,6 +179,9 @@ with right:
 
 uploaded = cam or upl
 
+if uploaded is not None:
+    st.image(uploaded, caption="Preview", width=300)
+
 ack_area = st.empty()
 status_area = st.empty()
 progress_area = st.empty()
@@ -265,7 +268,7 @@ def _poll_and_render():
             )
 
         st.markdown("### Generated output text")
-        st.markdown(st.session_state.output_text or "")
+        st.markdown((st.session_state.output_text or "").replace("$", "\\$"))
         return
 
     # Poll status
@@ -322,7 +325,7 @@ def _poll_and_render():
         )
 
         st.markdown("### Generated output text")
-        st.markdown(st.session_state.output_text or "")
+        st.markdown((st.session_state.output_text or "").replace("$", "\\$"))
 
 
 _poll_and_render()
