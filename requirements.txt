@@ -6,3 +6,7 @@ python-dotenv
 box-sdk-gen
 azure-servicebus
 pyjwt[crypto]
+rembg
+onnxruntime
+ultralytics
+easyocr

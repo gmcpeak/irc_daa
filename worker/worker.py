@@ -4,14 +4,17 @@ import io
 import json
 import logging
 import re
-from datetime import datetime
-from typing import Optional, List
+import time
+import uuid
 import queue
 import threading
+from datetime import datetime
+from typing import Optional, Dict, List, Tuple
 
 import dotenv
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 from PIL import Image, ImageOps
 from PIL.Image import Image as PILImage
@@ -49,57 +52,67 @@ OPENAI_KEY = os.getenv("OPENAI_KEY")
 if not OPENAI_KEY:
     raise RuntimeError("OPENAI_KEY not configured in .env")
 
+# Box upload target folder
+BOX_FOLDER_ID = os.getenv("BOX_FOLDER_ID", "333439130395")
+
+# Job retention (in-memory). If the container restarts, jobs are lost.
+JOB_TTL_SECONDS = int(os.getenv("JOB_TTL_SECONDS", "3600"))  # 1 hour
+MAX_TEXT_CHARS_STORED = int(os.getenv("MAX_TEXT_CHARS_STORED", "200000"))
+
 client = OpenAI(api_key=OPENAI_KEY)
 
 LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+
+DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
 app = FastAPI(title="Donation Audit Worker")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten this in prod if you want
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # -------------------------------------------------
-# in-memory job queue + worker thread
+# job model + store
 # -------------------------------------------------
-job_queue: "queue.Queue[tuple[bytes, str]]" = queue.Queue()
+class JobStatus:
+    QUEUED = "queued"
+    RUNNING = "running"
+    DONE = "done"
+    FAILED = "failed"
 
 
-def _queue_worker_loop():
-    """
-    Background loop that processes jobs from job_queue one at a time.
-    Each job is (image_bytes, filename).
-    """
-    logging.info("QueueWorker: starting background queue worker loop...")
-    while True:
-        try:
-            image_bytes, filename = job_queue.get()
-            logging.info(
-                "QueueWorker: picked up job for filename %s (queue size=%d)",
-                filename,
-                job_queue.qsize(),
-            )
-            _process_and_upload(image_bytes, filename)
-        except Exception:
-            logging.exception("QueueWorker: error during job processing.")
-        finally:
-            job_queue.task_done()
+class JobRecord(BaseModel):
+    job_id: str
+    status: str
+    expected_filename: str
+
+    created_at: float
+    started_at: Optional[float] = None
+    finished_at: Optional[float] = None
+
+    error: Optional[str] = None
+
+    # outputs
+    output_text: Optional[str] = None
+    docx_bytes: Optional[bytes] = None
+
+    # Box metadata
+    box_file_id: Optional[str] = None
+    box_file_name: Optional[str] = None
 
 
-# Start the worker thread when the module is imported
-_worker_thread = threading.Thread(
-    target=_queue_worker_loop,
-    name="queue-worker-thread",
-    daemon=True,
-)
-_worker_thread.start()
+jobs_lock = threading.Lock()
+jobs: Dict[str, JobRecord] = {}
 
 # -------------------------------------------------
-# helpers
+# in-memory queue + worker thread
 # -------------------------------------------------
+job_queue: "queue.Queue[Tuple[str, bytes, str]]" = queue.Queue()
+
+
 def _read_texts(paths: List[str]) -> str:
     parts: List[str] = []
     for p in paths:
@@ -112,7 +125,7 @@ def _read_texts(paths: List[str]) -> str:
 
 
 def _load_pil_from_bytes(data: bytes) -> Optional[PILImage]:
-    if data is None:
+    if not data:
         return None
     try:
         img = Image.open(io.BytesIO(data))
@@ -122,6 +135,10 @@ def _load_pil_from_bytes(data: bytes) -> Optional[PILImage]:
 
 
 def _openai_process(prompt_text: str, image: Optional[PILImage]) -> str:
+    """
+    Returns plain text. Note: we do NOT enable web_search tools here to avoid
+    special citation tokens being inserted into the output.
+    """
     content = []
     if prompt_text:
         content.append({"type": "input_text", "text": prompt_text})
@@ -134,10 +151,10 @@ def _openai_process(prompt_text: str, image: Optional[PILImage]) -> str:
         )
 
     resp = client.responses.create(
-        model="gpt-5",
+        model=os.getenv("OPENAI_MODEL", "gpt-5.1"),
         reasoning={"effort": "low"},
         text={"verbosity": "low"},
-        tools=[{"type": "web_search"}],
+        # tools intentionally omitted to keep output clean
         input=[{"role": "user", "content": content}] if content else prompt_text,
     )
 
@@ -147,7 +164,7 @@ def _openai_process(prompt_text: str, image: Optional[PILImage]) -> str:
             text = resp.output[0].content[0].text
         except Exception:
             text = str(resp)
-    return text
+    return text or ""
 
 
 def add_hyperlink(paragraph, text, url):
@@ -212,6 +229,7 @@ def _docx_bytes_from_text(
         doc.add_picture(img_buf, width=max_width)
         doc.add_paragraph("")
 
+    # Add text (convert markdown links to docx hyperlinks)
     for line in (text or "").splitlines():
         p = doc.add_paragraph()
         pos = 0
@@ -235,12 +253,6 @@ def _docx_bytes_from_text(
 
 
 def get_box_client_from_config(config_path: str = "config.json") -> BoxClient:
-    """
-    Build a Box client using ONLY config.json (no Azure env vars).
-
-    If your config.json includes a "sub" key for the user ID, we
-    impersonate that user; otherwise we act as the service account.
-    """
     with open(config_path, "r", encoding="utf-8") as f:
         cfg_json = json.load(f)
 
@@ -251,22 +263,18 @@ def get_box_client_from_config(config_path: str = "config.json") -> BoxClient:
         token_storage=FileWithInMemoryCacheTokenStorage(".user.jwt.cache"),
     )
 
-    # Start from app/service-auth context
     auth = BoxJWTAuth(jwt_cfg)
-
-    # If a user subject is configured, impersonate that user
     if user_id:
         auth = auth.with_user_subject(user_id)
 
-    client = BoxClient(auth)
-    return client
+    return BoxClient(auth)
 
 
 def upload_docx_bytes(
     client: BoxClient,
     file_name: str,
     docx_bytes: bytes,
-    folder_id: str = "0",
+    folder_id: str,
 ):
     stream = io.BytesIO(docx_bytes)
     attrs = UploadFileAttributes(
@@ -279,9 +287,7 @@ def upload_docx_bytes(
     except Exception as err:
         from box_sdk_gen import BoxAPIError
 
-        if isinstance(err, BoxAPIError) and err.response_info.body.get(
-            "code"
-        ) == "item_name_in_use":
+        if isinstance(err, BoxAPIError) and err.response_info.body.get("code") == "item_name_in_use":
             conflicts = err.response_info.body["context_info"]["conflicts"]
             box_file_id = conflicts["id"]
             stream.seek(0)
@@ -291,101 +297,229 @@ def upload_docx_bytes(
         raise
 
 
-# -------------------------------------------------
-# background processing
-# -------------------------------------------------
-def _process_and_upload(
-    image_bytes: bytes,
-    filename: str,
-) -> None:
-    """
-    Background job: run OpenAI, build DOCX, upload to Box.
-    Runs inside the queue worker thread.
-    """
-    try:
-        logging.info("BG: starting background processing...")
+def _set_job_fields(job_id: str, **fields):
+    with jobs_lock:
+        rec = jobs.get(job_id)
+        if not rec:
+            return
+        updated = rec.model_copy(update=fields)
+        jobs[job_id] = updated
 
-        # Rebuild the image from bytes
+
+def _process_job(job_id: str, image_bytes: bytes, expected_filename: str) -> None:
+    try:
+        _set_job_fields(job_id, status=JobStatus.RUNNING, started_at=time.time(), error=None)
+        logging.info("BG: job_id=%s starting processing...", job_id)
+
         image = _load_pil_from_bytes(image_bytes)
         if image is None:
-            logging.error("BG: could not decode image in background task.")
-            return
+            raise RuntimeError("Could not decode image")
 
-        # Build prompt
         system_prompt = _read_texts([PROMPT_PATH])
         guides_text = _read_texts([DOC1_PATH, DOC2_PATH])
-        full_prompt = (system_prompt or "") + "\n" + (guides_text or "")
+        full_prompt = (system_prompt or "") + "\n\n" + (guides_text or "")
 
-        # OpenAI
-        logging.info("BG: calling OpenAI...")
+        logging.info("BG: job_id=%s calling OpenAI...", job_id)
         out_text = _openai_process(full_prompt, image)
-        logging.info("BG: OpenAI call finished.")
 
-        # DOCX
-        logging.info("BG: building DOCX...")
+        # store text early (truncate to avoid unbounded memory)
+        if out_text and len(out_text) > MAX_TEXT_CHARS_STORED:
+            out_text = out_text[:MAX_TEXT_CHARS_STORED] + "\n\n[TRUNCATED]"
+        _set_job_fields(job_id, output_text=out_text)
+
+        logging.info("BG: job_id=%s building DOCX...", job_id)
         docx_bytes = _docx_bytes_from_text(out_text or "", image)
 
         # Box upload
-        logging.info("BG: building Box client from config.json...")
+        logging.info("BG: job_id=%s uploading DOCX to Box...", job_id)
         box_client = get_box_client_from_config("config.json")
-
-        logging.info("BG: uploading DOCX to Box...")
-        file_id, file_name = upload_docx_bytes(
-            box_client, filename, docx_bytes, folder_id="0"
+        box_file_id, box_file_name = upload_docx_bytes(
+            box_client, expected_filename, docx_bytes, folder_id=BOX_FOLDER_ID
         )
-        logging.info("BG: upload complete. Box id=%s, name=%s", file_id, file_name)
 
-    except Exception:
-        logging.exception("BG: error during background processing/upload.")
+        _set_job_fields(
+            job_id,
+            status=JobStatus.DONE,
+            finished_at=time.time(),
+            docx_bytes=docx_bytes,
+            box_file_id=str(box_file_id),
+            box_file_name=str(box_file_name),
+        )
+        logging.info("BG: job_id=%s done. Box id=%s", job_id, box_file_id)
+
+    except Exception as e:
+        logging.exception("BG: job_id=%s failed.", job_id)
+        _set_job_fields(
+            job_id,
+            status=JobStatus.FAILED,
+            finished_at=time.time(),
+            error=str(e),
+        )
+
+
+def _queue_worker_loop():
+    logging.info("QueueWorker: starting background queue worker loop...")
+    while True:
+        try:
+            job_id, image_bytes, expected_filename = job_queue.get()
+            logging.info("QueueWorker: picked up job_id=%s (queue size=%d)", job_id, job_queue.qsize())
+            _process_job(job_id, image_bytes, expected_filename)
+        except Exception:
+            logging.exception("QueueWorker: unexpected error.")
+        finally:
+            job_queue.task_done()
+
+
+def _cleanup_loop():
+    while True:
+        time.sleep(30)
+        now = time.time()
+        with jobs_lock:
+            to_delete = []
+            for jid, rec in jobs.items():
+                age = now - rec.created_at
+                if age > JOB_TTL_SECONDS:
+                    to_delete.append(jid)
+            for jid in to_delete:
+                jobs.pop(jid, None)
+
+
+_worker_thread = threading.Thread(target=_queue_worker_loop, name="queue-worker-thread", daemon=True)
+_worker_thread.start()
+
+_cleanup_thread = threading.Thread(target=_cleanup_loop, name="jobs-cleanup-thread", daemon=True)
+_cleanup_thread.start()
 
 
 # -------------------------------------------------
-# API schema + endpoint
+# API schema + endpoints
 # -------------------------------------------------
 class ProcessResponse(BaseModel):
     status_message: str
     expected_filename: str
+    job_id: str
+
+
+class JobStatusResponse(BaseModel):
+    job_id: str
+    status: str
+    expected_filename: str
+    created_at: float
+    started_at: Optional[float] = None
+    finished_at: Optional[float] = None
+    error: Optional[str] = None
+    download_ready: bool
+    output_text_ready: bool
+    box_file_id: Optional[str] = None
+    box_file_name: Optional[str] = None
+    output_text: Optional[str] = None
+
+
+@app.get("/health")
+def health():
+    return {"ok": True}
 
 
 @app.post("/process", response_model=ProcessResponse)
-async def process_endpoint(
-    file: UploadFile = File(...),
-):
-    """
-    Accept an image, enqueue background processing into an in-memory queue,
-    and return an immediate ACK. The heavy work (OpenAI + DOCX + Box upload)
-    runs in the queue worker thread, one job at a time.
-    """
-    logging.info("Worker: /process called, reading file bytes for ACK...")
+async def process_endpoint(file: UploadFile = File(...)):
     raw_bytes = await file.read()
     image = _load_pil_from_bytes(raw_bytes)
     if image is None:
-        logging.error("Worker: could not decode image.")
         raise HTTPException(status_code=400, detail="Could not decode image")
 
-    # Compute expected filename up front
-    filename = (
-        f"GW-IRC-Donation-Value-Audit--"
-        f"{datetime.now().strftime('%Y%m%d-%H%M%S')}.docx"
-    )
-    logging.info(
-        "Worker: enqueuing background job for filename %s (queue size before=%d)",
-        filename,
-        job_queue.qsize(),
+    job_id = uuid.uuid4().hex
+    expected_filename = (
+        f"GW-IRC-Donation-Value-Audit--{datetime.now().strftime('%Y%m%d-%H%M%S')}.docx"
     )
 
-    # Enqueue the job instead of using BackgroundTasks
-    job_queue.put((raw_bytes, filename))
+    rec = JobRecord(
+        job_id=job_id,
+        status=JobStatus.QUEUED,
+        expected_filename=expected_filename,
+        created_at=time.time(),
+    )
+    with jobs_lock:
+        jobs[job_id] = rec
+
+    job_queue.put((job_id, raw_bytes, expected_filename))
 
     status_message = (
-        "The worker has received your image and queued processing. "
-        "Requests are processed in the order they are received. "
-        "It is now safe to close this tab. "
-        "Your document will be uploaded to Box under the filename shown."
+        "The worker received your image and queued processing. "
+        "You may keep this tab open to download the result when ready, "
+        "or retrieve it later from Box under the filename shown."
     )
 
-    # Immediate ACK — OpenAI / Box will run later in the queue worker
     return ProcessResponse(
         status_message=status_message,
-        expected_filename=filename,
+        expected_filename=expected_filename,
+        job_id=job_id,
     )
+
+
+@app.get("/jobs/{job_id}", response_model=JobStatusResponse)
+def get_job_status(
+    job_id: str,
+    include_text: bool = Query(False, description="If true, include output_text in response."),
+    text_truncate: int = Query(20000, ge=0, le=200000, description="Max chars of output_text to return."),
+):
+    with jobs_lock:
+        rec = jobs.get(job_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    download_ready = bool(rec.docx_bytes) and rec.status == JobStatus.DONE
+    output_text_ready = bool(rec.output_text) and rec.status in (JobStatus.DONE, JobStatus.FAILED)
+
+    out_text = None
+    if include_text and rec.output_text:
+        out_text = rec.output_text[:text_truncate] if text_truncate else rec.output_text
+
+    return JobStatusResponse(
+        job_id=rec.job_id,
+        status=rec.status,
+        expected_filename=rec.expected_filename,
+        created_at=rec.created_at,
+        started_at=rec.started_at,
+        finished_at=rec.finished_at,
+        error=rec.error,
+        download_ready=download_ready,
+        output_text_ready=output_text_ready,
+        box_file_id=rec.box_file_id,
+        box_file_name=rec.box_file_name,
+        output_text=out_text,
+    )
+
+
+@app.get("/jobs/{job_id}/text")
+def get_job_text(job_id: str):
+    with jobs_lock:
+        rec = jobs.get(job_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if not rec.output_text and rec.status not in (JobStatus.DONE, JobStatus.FAILED):
+        # still running/queued
+        return JSONResponse(status_code=202, content={"detail": "Not ready yet"})
+
+    if rec.status == JobStatus.FAILED and not rec.output_text:
+        # failed before producing any text
+        raise HTTPException(status_code=500, detail=rec.error or "Job failed")
+
+    return PlainTextResponse(rec.output_text or "")
+
+
+@app.get("/jobs/{job_id}/docx")
+def download_docx(job_id: str):
+    with jobs_lock:
+        rec = jobs.get(job_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if rec.status != JobStatus.DONE or not rec.docx_bytes:
+        return JSONResponse(status_code=202, content={"detail": "Not ready yet"})
+
+    filename = rec.expected_filename or "Donation-Audit.docx"
+    stream = io.BytesIO(rec.docx_bytes)
+
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return StreamingResponse(stream, media_type=DOCX_MIME, headers=headers)
