@@ -41,6 +41,7 @@ _ss_init("output_text", None)
 _ss_init("result_for_job_id", None)  # ensure we don't mix results across jobs
 
 _ss_init("last_ack_message", None)
+_ss_init("last_cam_val", None)
 
 # NEW: bump this to reset camera/uploader widgets
 _ss_init("input_key_version", 0)
@@ -170,6 +171,17 @@ left, right = st.columns(2)
 # IMPORTANT: use versioned keys so we can reset these widgets after Process
 with left:
     cam = st.camera_input("Take a photo", key=_wkey("camera"))
+
+    # FIX: If user clicks "Clear photo", force a hard reset of valid keys.
+    # Otherwise, the widget (or Streamlit) gets into a state where
+    # the next photo does NOT trigger a correct rerun/value update unless taken twice.
+    if st.session_state.last_cam_val is not None and cam is None:
+        _bump_input_widgets()
+        st.session_state.last_cam_val = None
+        st.rerun()
+
+    st.session_state.last_cam_val = cam
+
 with right:
     upl = st.file_uploader(
         "...or upload a photo",
@@ -230,6 +242,8 @@ if st.button("Process", type="primary", disabled=(uploaded is None)):
 
         # NEW: reset camera/uploader widgets so users can submit another image immediately
         _bump_input_widgets()
+        # Also clear the tracker so we don't trigger the "Clear Photo" logic on next run
+        st.session_state.last_cam_val = None
 
         # Immediately rerun so the cleared widgets appear right away
         st.rerun()
